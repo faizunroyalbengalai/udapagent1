@@ -1,0 +1,129 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>UDAP Agent</title>
+  <style>
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body {
+      font-family: "Segoe UI", Arial, sans-serif;
+      background: linear-gradient(135deg, #0f0c29, #302b63, #24243e);
+      min-height: 100vh;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      color: #fff;
+    }
+    .card {
+      background: rgba(255,255,255,.08);
+      backdrop-filter: blur(12px);
+      border: 1px solid rgba(255,255,255,.15);
+      border-radius: 20px;
+      padding: 48px 56px;
+      text-align: center;
+      max-width: 560px;
+      width: 90%;
+      box-shadow: 0 20px 60px rgba(0,0,0,.4);
+    }
+    .logo {
+      font-size: 2.4rem;
+      font-weight: 700;
+      margin-bottom: 6px;
+    }
+    .logo span {
+      background: linear-gradient(90deg, #6ee7f7, #a78bfa);
+      -webkit-background-clip: text;
+      -webkit-text-fill-color: transparent;
+    }
+    .by {
+      font-size: .8rem;
+      color: rgba(255,255,255,.45);
+      letter-spacing: 2px;
+      text-transform: uppercase;
+      margin-bottom: 32px;
+    }
+    .divider {
+      border: none;
+      border-top: 1px solid rgba(255,255,255,.1);
+      margin: 24px 0;
+    }
+    .db {
+      margin-top: 20px;
+      padding: 14px 18px;
+      border-radius: 12px;
+      text-align: left;
+      font-size: .88rem;
+      transition: all .2s ease;
+    }
+    .connected { background: rgba(52,199,89,.15); border: 1px solid rgba(52,199,89,.4); }
+    .disconnected { background: rgba(255,59,48,.12); border: 1px solid rgba(255,59,48,.3); }
+    .loading { background: rgba(110,231,247,.10); border: 1px solid rgba(110,231,247,.25); }
+    .dot {
+      display: inline-block;
+      width: 9px;
+      height: 9px;
+      border-radius: 50%;
+      margin-right: 8px;
+      vertical-align: middle;
+    }
+    .green { background: #34c759; box-shadow: 0 0 6px #34c759; }
+    .red { background: #ff3b30; box-shadow: 0 0 6px #ff3b30; }
+    .blue { background: #6ee7f7; box-shadow: 0 0 6px #6ee7f7; }
+    .dbinfo {
+      font-size: .76rem;
+      color: rgba(255,255,255,.6);
+      margin-top: 5px;
+      padding-left: 17px;
+      word-break: break-word;
+    }
+    .footer {
+      font-size: .72rem;
+      color: rgba(255,255,255,.25);
+      margin-top: 24px;
+    }
+  </style>
+</head>
+<body>
+  <div class="card">
+    <div class="logo">UDAP <span>Agent</span></div>
+    <div class="by">Developed by Royal Bengal AI</div>
+    <hr class="divider">
+
+    <div id="db-status" class="db loading">
+      <div><span class="dot blue"></span><strong>Checking Database Status...</strong></div>
+      <div class="dbinfo">Calling <code>/api/status</code></div>
+    </div>
+
+    <div class="footer">Powered by Spring Boot</div>
+  </div>
+
+  <script>
+    async function loadStatus() {
+      const card = document.getElementById("db-status");
+      try {
+        const response = await fetch("/api/status", { headers: { "Accept": "application/json" } });
+        if (!response.ok) {
+          throw new Error("HTTP " + response.status);
+        }
+        const data = await response.json();
+        const ok = data.status === "connected";
+        card.className = "db " + (ok ? "connected" : "disconnected");
+        card.innerHTML =
+          '<div><span class="dot ' + (ok ? "green" : "red") + '"></span><strong>' +
+          (data.title || (ok ? "Database Connected" : "Database Unreachable")) +
+          '</strong></div><div class="dbinfo">' +
+          (data.detail || "No details available.") +
+          "</div>";
+      } catch (error) {
+        card.className = "db disconnected";
+        card.innerHTML =
+          '<div><span class="dot red"></span><strong>Database Status Check Failed</strong></div>' +
+          '<div class="dbinfo">' + error.message + "</div>";
+      }
+    }
+
+    loadStatus();
+  </script>
+</body>
+</html>
