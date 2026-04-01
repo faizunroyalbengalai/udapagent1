@@ -1,0 +1,229 @@
+on:
+  workflow_dispatch:
+
+concurrency:
+  group: deploy-${{ github.repository }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    outputs:
+      jar_name: ${{ steps.jar.outputs.jar_name }}
+      jar_path: ${{ steps.jar.outputs.jar_path }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Java
+        uses: actions/setup-java@v4
+        with:
+          java-version: '17'
+          distribution: temurin
+          cache: maven
+
+      - name: Build application
+        run: |
+          if [ -f mvnw ] && [ -f .mvn/wrapper/maven-wrapper.properties ]; then
+            chmod +x mvnw && ./mvnw clean package -DskipTests
+          elif [ -f pom.xml ]; then
+            mvn clean package -DskipTests
+          elif [ -f gradlew ] && [ -f gradle/wrapper/gradle-wrapper.properties ]; then
+            chmod +x gradlew && ./gradlew bootJar -x test
+          elif [ -f build.gradle ] || [ -f build.gradle.kts ]; then
+            gradle bootJar -x test
+          else
+            echo "ERROR: No Maven or Gradle build file found" && exit 1
+          fi
+
+      - name: Find and export JAR
+        id: jar
+        run: |
+          JAR=$(find target build/libs -name "*.jar" \
+            ! -name "*sources*" ! -name "*javadoc*" ! -name "*plain*" \
+            2>/dev/null | head -1)
+          if [ -z "$JAR" ]; then
+            echo "ERROR: No JAR built" && exit 1
+          fi
+          echo "jar_name=$(basename $JAR)" >> $GITHUB_OUTPUT
+          echo "jar_path=$JAR" >> $GITHUB_OUTPUT
+          echo "Built JAR: $JAR"
+
+      - name: Upload JAR artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: app-jar
+          path: ${{ steps.jar.outputs.jar_path }}
+          retention-days: 1
+
+  provision:
+    needs: build
+    runs-on: ubuntu-latest
+    outputs:
+      server_ip: ${{ steps.get_ip.outputs.ip }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: hashicorp/setup-terraform@v3
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v5
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ secrets.AWS_REGION }}
+
+      - name: Check existing EC2
+        id: check_ec2
+        run: |
+          PROJECT="${{ secrets.PROJECT_NAME }}"
+          EXISTING_IP=$(aws ec2 describe-instances \
+            --filters "Name=tag:Project,Values=$PROJECT" \
+                      "Name=instance-state-name,Values=running" \
+            --query "Reservations[0].Instances[0].PublicIpAddress" \
+            --output text 2>/dev/null || echo "None")
+          KEY_EXISTS=$(aws ec2 describe-key-pairs \
+            --filters "Name=key-name,Values=$PROJECT-key" \
+            --query "KeyPairs[0].KeyName" --output text 2>/dev/null || echo "None")
+          SG_ID=$(aws ec2 describe-security-groups \
+            --filters "Name=group-name,Values=$PROJECT-sg" \
+            --query "SecurityGroups[0].GroupId" --output text 2>/dev/null || echo "None")
+          if [ "$EXISTING_IP" != "None" ] && [ "$EXISTING_IP" != "null" ] && [ -n "$EXISTING_IP" ]; then
+            echo "exists=true" >> $GITHUB_OUTPUT
+            echo "ip=$EXISTING_IP" >> $GITHUB_OUTPUT
+          else
+            echo "exists=false" >> $GITHUB_OUTPUT
+          fi
+          echo "key_exists=$KEY_EXISTS" >> $GITHUB_OUTPUT
+          echo "sg_id=$SG_ID" >> $GITHUB_OUTPUT
+
+      - name: Create S3 state bucket
+        if: steps.check_ec2.outputs.exists != 'true'
+        run: |
+          aws s3 mb s3://${{ secrets.TF_STATE_BUCKET }} --region ${{ secrets.AWS_REGION }} 2>/dev/null || true
+
+      - name: Terraform Init
+        if: steps.check_ec2.outputs.exists != 'true'
+        run: |
+          terraform init -reconfigure \
+            -backend-config="bucket=${{ secrets.TF_STATE_BUCKET }}" \
+            -backend-config="region=${{ secrets.AWS_REGION }}" \
+            -backend-config="key=${{ secrets.PROJECT_NAME }}/terraform.tfstate"
+        working-directory: terraform
+
+      - name: Import existing resources
+        if: steps.check_ec2.outputs.exists != 'true'
+        run: |
+          KEY="${{ steps.check_ec2.outputs.key_exists }}"
+          SG="${{ steps.check_ec2.outputs.sg_id }}"
+          [ "$KEY" != "None" ] && terraform import \
+            -var="public_key=${{ secrets.SSH_PUBLIC_KEY }}" \
+            -var="project_name=${{ secrets.PROJECT_NAME }}" \
+            -var="aws_region=${{ secrets.AWS_REGION }}" \
+            aws_key_pair.deployer "${{ secrets.PROJECT_NAME }}-key" 2>/dev/null || true
+          [ "$SG" != "None" ] && terraform import \
+            -var="public_key=${{ secrets.SSH_PUBLIC_KEY }}" \
+            -var="project_name=${{ secrets.PROJECT_NAME }}" \
+            -var="aws_region=${{ secrets.AWS_REGION }}" \
+            aws_security_group.sg "$SG" 2>/dev/null || true
+        working-directory: terraform
+
+      - name: Terraform Plan
+        if: steps.check_ec2.outputs.exists != 'true'
+        run: |
+          terraform plan \
+            -var="public_key=${{ secrets.SSH_PUBLIC_KEY }}" \
+            -var="project_name=${{ secrets.PROJECT_NAME }}" \
+            -var="aws_region=${{ secrets.AWS_REGION }}" \
+            -out=tfplan
+        working-directory: terraform
+
+      - name: Terraform Apply
+        if: steps.check_ec2.outputs.exists != 'true'
+        run: terraform apply -auto-approve tfplan
+        working-directory: terraform
+
+      - name: Get IP
+        id: get_ip
+        run: |
+          if [ "${{ steps.check_ec2.outputs.exists }}" == "true" ]; then
+            echo "ip=${{ steps.check_ec2.outputs.ip }}" >> $GITHUB_OUTPUT
+          else
+            echo "ip=$(terraform output -raw public_ip)" >> $GITHUB_OUTPUT
+          fi
+        working-directory: terraform
+
+  deploy:
+    needs: [build, provision]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download JAR artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: app-jar
+          path: ansible/jar/
+
+      - name: Write SSH key
+        run: |
+          echo "${{ secrets.SSH_PRIVATE_KEY }}" > /tmp/deploy_key
+          chmod 600 /tmp/deploy_key
+
+      - name: Wait for SSH
+        run: |
+          for i in $(seq 1 30); do
+            ssh -o StrictHostKeyChecking=no -o ConnectTimeout=5 \
+              -i /tmp/deploy_key ${{ secrets.SSH_USER || 'ubuntu' }}@${{ needs.provision.outputs.server_ip }} echo ok \
+              && break || sleep 10
+          done
+
+      - name: Run Ansible
+        run: |
+          ansible-playbook ansible/playbook.yml \
+            -i "${{ needs.provision.outputs.server_ip }}," \
+            --private-key /tmp/deploy_key \
+            -u ${{ secrets.SSH_USER || 'ubuntu' }} \
+            -e "jar_name=${{ needs.build.outputs.jar_name }}" \
+            -e "spring_datasource_url=${{ secrets.SPRING_DATASOURCE_URL }}" \
+            -e "spring_datasource_username=${{ secrets.SPRING_DATASOURCE_USERNAME }}" \
+            -e "spring_datasource_password=${{ secrets.SPRING_DATASOURCE_PASSWORD }}" \
+            -e "spring_data_mongodb_uri=${{ secrets.SPRING_DATA_MONGODB_URI }}" \
+            -e "spring_profiles_active=${{ secrets.SPRING_PROFILES_ACTIVE }}" \
+            -e "install_db=${{ secrets.INSTALL_DB_ON_EC2 }}" \
+            -e "db_type=${{ secrets.DB_TYPE }}" \
+            -e "db_name=${{ secrets.DB_NAME }}" \
+            -e "db_username=${{ secrets.DB_USERNAME }}" \
+            -e "db_password=${{ secrets.DB_PASSWORD }}"
+        env:
+          ANSIBLE_HOST_KEY_CHECKING: "False"
+
+  verify:
+    needs: [provision, deploy]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Health check
+        run: |
+          echo "Checking application at http://${{ needs.provision.outputs.server_ip }}/"
+          for i in $(seq 1 12); do
+            STATUS=$(curl -s -o /dev/null -w "%{http_code}" \
+              --connect-timeout 10 --max-time 15 \
+              http://${{ needs.provision.outputs.server_ip }}/ 2>/dev/null || echo "000")
+            echo "Attempt $i: HTTP $STATUS"
+            if [ "$STATUS" != "000" ]; then
+              echo "Application is responding with HTTP $STATUS"
+              exit 0
+            fi
+            sleep 10
+          done
+          echo "WARNING: Application did not respond after all attempts"
+
+  notify:
+    needs: [provision, verify]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Print live URL
+        run: |
+          echo "============================================"
+          echo "Deployment complete!"
+          echo "Live URL: http://${{ needs.provision.outputs.server_ip }}/"
+          echo "============================================"
