@@ -1,0 +1,310 @@
+---
+- name: Deploy Spring Boot application
+  hosts: all
+  become: yes
+
+  vars:
+    app_dir: /opt/app
+    app_port: 8080
+    service_name: spring-app
+    java_version: "17"
+
+  handlers:
+    - name: restart spring-app
+      systemd:
+        name: "{{ service_name }}"
+        state: restarted
+        daemon_reload: yes
+
+    - name: restart nginx
+      service:
+        name: nginx
+        state: restarted
+
+  tasks:
+    - name: Update apt cache
+      apt:
+        update_cache: yes
+        cache_valid_time: 3600
+
+    - name: Install Java JRE and nginx
+      apt:
+        name:
+          - openjdk-{{ java_version }}-jre-headless
+          - nginx
+          - curl
+        state: present
+
+    - name: Find java binary path
+      command: which java
+      register: java_bin
+      changed_when: false
+
+    - name: Install PostgreSQL
+      apt:
+        name:
+          - postgresql
+          - postgresql-contrib
+        state: present
+      when: install_db|default('false')|string == 'true' and db_type|default('') == 'postgres'
+
+    - name: Start and enable PostgreSQL
+      systemd:
+        name: postgresql
+        state: started
+        enabled: yes
+      when: install_db|default('false')|string == 'true' and db_type|default('') == 'postgres'
+
+    - name: Fix PostgreSQL SCRAM auth to md5
+      shell: |
+        HBA=$(sudo find /etc/postgresql -name pg_hba.conf | head -1)
+        sudo sed -i 's/scram-sha-256/md5/g' $HBA
+        sudo systemctl reload postgresql
+      become: yes
+      when: install_db|default('false')|string == 'true' and db_type|default('') == 'postgres'
+
+    - name: Create PostgreSQL database
+      shell: |
+        sudo -u postgres psql -tc "SELECT 1 FROM pg_database WHERE datname='{{ db_name }}'" | grep -q 1 || sudo -u postgres psql -c "CREATE DATABASE {{ db_name }};"
+      become: yes
+      when: install_db|default('false')|string == 'true' and db_type|default('') == 'postgres'
+
+    - name: Create PostgreSQL user
+      shell: |
+        sudo -u postgres psql -tc "SELECT 1 FROM pg_roles WHERE rolname='{{ db_username }}'" | grep -q 1 || sudo -u postgres psql -c "CREATE USER {{ db_username }} WITH ENCRYPTED PASSWORD '{{ db_password }}';"
+      become: yes
+      when: install_db|default('false')|string == 'true' and db_type|default('') == 'postgres'
+
+    - name: Grant PostgreSQL privileges
+      shell: |
+        sudo -u postgres psql -c "GRANT ALL PRIVILEGES ON DATABASE {{ db_name }} TO {{ db_username }};"
+      become: yes
+      when: install_db|default('false')|string == 'true' and db_type|default('') == 'postgres'
+
+    - name: Install MySQL
+      apt:
+        name: mysql-server
+        state: present
+      when: install_db|default('false')|string == 'true' and db_type|default('') == 'mysql'
+
+    - name: Start and enable MySQL
+      systemd:
+        name: mysql
+        state: started
+        enabled: yes
+      when: install_db|default('false')|string == 'true' and db_type|default('') == 'mysql'
+
+    - name: Create MySQL database
+      shell: |
+        mysql -u root -e "CREATE DATABASE IF NOT EXISTS {{ db_name }};"
+      become: yes
+      when: install_db|default('false')|string == 'true' and db_type|default('') == 'mysql'
+
+    - name: Create MySQL user and grant privileges
+      shell: |
+        mysql -u root -e "CREATE USER IF NOT EXISTS '{{ db_username }}'@'localhost' IDENTIFIED BY '{{ db_password }}'; GRANT ALL ON {{ db_name }}.* TO '{{ db_username }}'@'localhost'; FLUSH PRIVILEGES;"
+      become: yes
+      when: install_db|default('false')|string == 'true' and db_type|default('') == 'mysql'
+
+    - name: Install gnupg and curl for MongoDB
+      apt:
+        name:
+          - gnupg
+          - curl
+        state: present
+      when: install_db|default('false')|string == 'true' and db_type|default('') == 'mongodb'
+
+    - name: Add MongoDB GPG key
+      shell: |
+        curl -fsSL https://pgp.mongodb.com/server-7.0.asc | sudo gpg -o /usr/share/keyrings/mongodb-server-7.0.gpg --dearmor
+      args:
+        creates: /usr/share/keyrings/mongodb-server-7.0.gpg
+      when: install_db|default('false')|string == 'true' and db_type|default('') == 'mongodb'
+
+    - name: Add MongoDB apt repository
+      shell: |
+        echo "deb [ arch=amd64,arm64 signed-by=/usr/share/keyrings/mongodb-server-7.0.gpg ] https://repo.mongodb.org/apt/ubuntu jammy/mongodb-org/7.0 multiverse" | sudo tee /etc/apt/sources.list.d/mongodb-org-7.0.list
+      args:
+        creates: /etc/apt/sources.list.d/mongodb-org-7.0.list
+      when: install_db|default('false')|string == 'true' and db_type|default('') == 'mongodb'
+
+    - name: Update apt cache for MongoDB
+      apt:
+        update_cache: yes
+      when: install_db|default('false')|string == 'true' and db_type|default('') == 'mongodb'
+
+    - name: Install MongoDB
+      apt:
+        name: mongodb-org
+        state: present
+      when: install_db|default('false')|string == 'true' and db_type|default('') == 'mongodb'
+
+    - name: Start and enable MongoDB
+      systemd:
+        name: mongod
+        state: started
+        enabled: yes
+      when: install_db|default('false')|string == 'true' and db_type|default('') == 'mongodb'
+
+    - name: Create MongoDB database and initial collection
+      shell: |
+        mongosh --eval 'db.getSiblingDB("{{ db_name }}").createCollection("init")'
+      become: yes
+      when: install_db|default('false')|string == 'true' and db_type|default('') == 'mongodb'
+
+    - name: Create app directory
+      file:
+        path: "{{ app_dir }}"
+        state: directory
+        owner: ubuntu
+        group: ubuntu
+        mode: "0755"
+
+    - name: Copy JAR to server
+      copy:
+        src: "jar/{{ jar_name }}"
+        dest: "{{ app_dir }}/app.jar"
+        owner: ubuntu
+        group: ubuntu
+        mode: "0644"
+
+    - name: Verify JAR was copied
+      stat:
+        path: "{{ app_dir }}/app.jar"
+      register: jar_stat
+
+    - name: Fail if JAR missing
+      fail:
+        msg: "JAR not found at {{ app_dir }}/app.jar — copy step may have failed. jar_name={{ jar_name }}"
+      when: not jar_stat.stat.exists
+
+    - name: Create systemd service
+      copy:
+        dest: /etc/systemd/system/{{ service_name }}.service
+        owner: root
+        group: root
+        mode: "0644"
+        content: |
+          [Unit]
+          Description=Spring Boot Application
+          After=network.target
+
+          [Service]
+          User=ubuntu
+          WorkingDirectory={{ app_dir }}
+          ExecStart={{ java_bin.stdout }} -jar {{ app_dir }}/app.jar
+          SuccessExitStatus=143
+          Restart=on-failure
+          RestartSec=10
+          Environment=SERVER_PORT={{ app_port }}
+          Environment=SPRING_OUTPUT_ANSI_ENABLED=NEVER
+          {% if spring_datasource_url is defined and spring_datasource_url %}
+          Environment=SPRING_DATASOURCE_URL={{ spring_datasource_url }}
+          Environment=SPRING_DATASOURCE_USERNAME={{ spring_datasource_username | default('') }}
+          Environment=SPRING_DATASOURCE_PASSWORD={{ spring_datasource_password | default('') }}
+          {% endif %}
+          {% if spring_data_mongodb_uri is defined and spring_data_mongodb_uri %}
+          Environment=SPRING_DATA_MONGODB_URI={{ spring_data_mongodb_uri }}
+          {% endif %}
+          {% if spring_profiles_active is defined and spring_profiles_active %}
+          Environment=SPRING_PROFILES_ACTIVE={{ spring_profiles_active }}
+          {% endif %}
+          StandardOutput=journal
+          StandardError=journal
+
+          [Install]
+          WantedBy=multi-user.target
+      notify: restart spring-app
+
+    - name: Enable and start spring-app service
+      systemd:
+        name: "{{ service_name }}"
+        enabled: yes
+        state: restarted
+        daemon_reload: yes
+
+    - name: Wait for Spring Boot to start
+      wait_for:
+        host: 127.0.0.1
+        port: "{{ app_port }}"
+        delay: 15
+        timeout: 120
+        state: started
+      ignore_errors: yes
+      register: port_wait
+
+    - name: Capture service logs if startup failed
+      command: journalctl -u {{ service_name }} -n 100 --no-pager
+      register: service_logs
+      when: port_wait is failed
+      changed_when: false
+      ignore_errors: yes
+
+    - name: Show service logs
+      debug:
+        msg: "{{ service_logs.stdout_lines }}"
+      when: port_wait is failed
+
+    - name: Fail with clear message if app did not start
+      fail:
+        msg: "Spring Boot did not start on port 8080. See journalctl output above."
+      when: port_wait is failed
+
+    - name: Report server IP
+      debug:
+        msg: "server_ip={{ ansible_host }}"
+
+    - name: Configure nginx reverse proxy
+      copy:
+        dest: /etc/nginx/sites-available/spring-boot
+        owner: root
+        group: root
+        mode: "0644"
+        content: |
+          server {
+              listen 80 default_server;
+              listen [::]:80 default_server;
+              server_name _;
+              location / {
+                  proxy_pass http://127.0.0.1:{{ app_port }};
+                  proxy_set_header Host $host;
+                  proxy_set_header X-Real-IP $remote_addr;
+                  proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+                  proxy_set_header X-Forwarded-Proto $scheme;
+                  proxy_connect_timeout 60s;
+                  proxy_read_timeout 60s;
+              }
+          }
+      notify: restart nginx
+
+    - name: Enable nginx site
+      file:
+        src: /etc/nginx/sites-available/spring-boot
+        dest: /etc/nginx/sites-enabled/spring-boot
+        state: link
+      notify: restart nginx
+
+    - name: Remove default nginx site
+      file:
+        path: /etc/nginx/sites-enabled/default
+        state: absent
+      notify: restart nginx
+
+    - name: Flush handlers
+      meta: flush_handlers
+
+    - name: Verify application is responding
+      uri:
+        url: "http://127.0.0.1:{{ app_port }}/actuator/health"
+        method: GET
+        status_code:
+          - 200
+          - 404
+          - 503
+        timeout: 30
+      register: health_check
+      ignore_errors: yes
+
+    - name: Report deployment success
+      debug:
+        msg: "Spring Boot deployed successfully. Live at http://{{ ansible_host }}/"
