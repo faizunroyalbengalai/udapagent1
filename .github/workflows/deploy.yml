@@ -12,7 +12,7 @@ jobs:
       jar_name: ${{ steps.jar.outputs.jar_name }}
       jar_path: ${{ steps.jar.outputs.jar_path }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - name: Set up Java
         uses: actions/setup-java@v4
@@ -61,7 +61,7 @@ jobs:
     outputs:
       server_ip: ${{ steps.get_ip.outputs.ip }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - uses: hashicorp/setup-terraform@v3
 
@@ -156,10 +156,10 @@ jobs:
     needs: [build, provision]
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - name: Download JAR artifact
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v5
         with:
           name: app-jar
           path: ansible/jar/
